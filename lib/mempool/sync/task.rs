@@ -331,6 +331,10 @@ where
                         }
                     }
                 }
+                // A confirmed tx must never remain rejected, otherwise
+                // `try_get_parent_txs_from_caches` would keep rejecting its
+                // children indefinitely.
+                sync_state.rejected_txs.remove(&txid);
                 sync_state.tx_cache.insert(txid, tx);
             }
             for txid in remove_mempool_txs {
