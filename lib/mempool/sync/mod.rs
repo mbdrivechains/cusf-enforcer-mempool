@@ -265,12 +265,26 @@ impl FromIterator<SyncAction> for SyncActionQueue {
 /// Measured on a ~77k tx mainnet mempool: unbounded, the initial sync exceeded
 /// [`APPLY_SYNC_ACTION_TIMEOUT`], taking 45–80s when it did survive.
 /// Capped at this value, 9 of 10 runs completed, in 25–30s.
+// Kept at 1_000 (miner4 2026-09-04). A trial at 200 made init MUCH slower under
+// cs_main contention: each RPC call costs ~1 min there regardless of item count
+// (it queues behind other clients on the node's RPC threads, each stuck on the
+// lock), so more, smaller calls lose — one init blew a 600 s guard. Large
+// batches are safe now that the node-RPC client timeout is 600 s.
 const MAX_TX_REQUESTS_PER_BATCH: usize = 1_000;
 
 /// Timeout waiting to apply the next sync action before its dependencies
 /// were available.
+// Raised 15s -> 120s -> 600s (miner4 deploy 2026-09-04): during background
+// validation the node answers getrawtransaction slowly (cs_main held through
+// disk IO), so a batched fetch that a head action waits on takes minutes. At
+// 15s no init completed; at 120s inits completed but the live sync died on the
+// next batch (three runs, each killed ~2-4 min after serving). 600s waits a
+// batch out and resumes from the ZMQ backlog instead of re-initialising. The
+// runner's 10-min unserving guard bounds a genuinely stuck action. Revisit
+// after the validation-vs-mining disk conflict is gone (transplant on
+// beta/mainnet).
 const APPLY_SYNC_ACTION_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(15);
+    std::time::Duration::from_secs(600);
 
 /// Future that fires once the action at the head of `action_queue` has waited
 /// longer than APPLY_SYNC_ACTION_TIMEOUT for its dependencies, or stays pending
