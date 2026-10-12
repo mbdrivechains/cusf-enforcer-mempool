@@ -737,6 +737,7 @@ async fn block_txs<const COINBASE_TXN: bool, BP>(
 
 struct MempoolQueryOutput {
     prev_blockhash: BlockHash,
+    tip_block_time: u32,
     tip_block_mediantime: u32,
     tip_block_height: u32,
     coinbase_txn: Option<Transaction>,
@@ -788,6 +789,7 @@ where
     };
     Ok(MempoolQueryOutput {
         prev_blockhash: tip_block.hash,
+        tip_block_time: tip_block.time,
         tip_block_mediantime: tip_block.mediantime,
         tip_block_height: tip_block.height,
         coinbase_txn,
@@ -991,6 +993,7 @@ where
             })?;
         let MempoolQueryOutput {
             prev_blockhash,
+            tip_block_time,
             tip_block_mediantime,
             tip_block_height,
             coinbase_txn,
@@ -1002,7 +1005,53 @@ where
             }
             CachedMempoolQueryOutput::Queried(query_output) => *query_output,
         };
-        let target = {
+        let height = tip_block_height + 1;
+        let consensus_params: &bitcoin::params::Params = self.network.as_ref();
+        // Core's node::GetMinimumTime: MTP + 1, and at every retarget height the BIP94
+        // timewarp floor (prev - MAX_TIMEWARP), on every network. Without the floor a
+        // template stamped with the wall clock can be rejected (`time-timewarp-attack`)
+        // when the window's last block is dated ahead (cusf-enforcer-mempool#132).
+        const MAX_TIMEWARP: u64 = 600;
+        let mut mintime = tip_block_mediantime as u64 + 1;
+        if u64::from(height) % consensus_params.difficulty_adjustment_interval() == 0 {
+            mintime = mintime.max((tip_block_time as u64).saturating_sub(MAX_TIMEWARP));
+        }
+        // Networks with min-difficulty blocks (the testnet 20-minute rule; easynet runs
+        // it under ASERT) make the next target depend on the block's time, so a target
+        // cached per tip goes wrong once 20 minutes pass without a block: every block
+        // found would carry the old bits with a late time and be invalid, and the chain
+        // would stall. There, take target and times from the node's own template, so
+        // Core stays the one authority (ASERT, 20-minute rule, timewarp floor).
+        let node_times = if consensus_params.allow_min_difficulty_blocks {
+            let mut node_request = BlockTemplateRequest::default();
+            node_request.rules.push("bip300301".to_owned());
+            let node_template = self
+                .rpc_client
+                .get_block_template(node_request)
+                .await
+                .map_err(|err| {
+                    let err = log_error(anyhow::Error::from(err));
+                    internal_error(err)
+                })?;
+            if node_template.prev_blockhash != prev_blockhash {
+                let err = anyhow::anyhow!(
+                    "node tip {} differs from mempool tip {prev_blockhash}; retry",
+                    node_template.prev_blockhash
+                );
+                let err = log_error(err);
+                return Err(internal_error(err));
+            }
+            Some((
+                bitcoin::Target::from_compact(node_template.compact_target),
+                node_template.mintime,
+                node_template.current_time,
+            ))
+        } else {
+            None
+        };
+        let target = if let Some((node_target, _, _)) = node_times {
+            node_target
+        } else {
             let known_target =
                 self.known_targets.read().get(&prev_blockhash).copied();
             if let Some(target) = known_target {
@@ -1048,16 +1097,13 @@ where
         } else {
             coinbase_txn_or_value.clone()
         };
-        let mintime =
-            // TODO: calculate this correctly
-            /*
-            std::cmp::max(
-                tip_block_mediantime as u64 + 1,
-                current_time_adjusted,
-            )
-            */
-            tip_block_mediantime as u64 + 1;
-        let height = tip_block_height + 1;
+        let current_time = match node_times {
+            Some((_, node_mintime, node_curtime)) => {
+                mintime = mintime.max(node_mintime);
+                node_curtime.max(mintime)
+            }
+            None => current_time_adjusted.max(mintime),
+        };
         let res = BlockTemplate {
             capabilities: SERVER_CAPABILITIES
                 .iter()
@@ -1082,7 +1128,7 @@ where
             sigop_limit,
             size_limit,
             weight_limit,
-            current_time: current_time_adjusted,
+            current_time,
             compact_target: target.to_compact_lossy(),
             height,
             default_witness_commitment,
