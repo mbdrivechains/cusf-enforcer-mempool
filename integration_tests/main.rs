@@ -8,7 +8,8 @@ use cusf_enforcer_mempool_integration_tests::{
     test_conflict_eviction_at_block_connect,
     test_connect_block_deprioritizes_removed_txs,
     test_disconnect_through_sync_tip, test_double_insert_after_reorg,
-    test_enforcer_rejection_during_reorg, test_gbt_long_poll,
+    test_enforcer_rejection_during_reorg, test_finalize_rejects_proposed_tx,
+    test_gbt_long_poll,
     test_invalid_block_during_initial_sync, test_mempool_dat_fast_path,
     test_orphan_admitted_after_disconnect_removal,
     test_orphan_admitted_after_enforcer_removal,
@@ -266,6 +267,11 @@ fn run() -> anyhow::Result<std::process::ExitCode> {
                 test_rbf_removed_for_absent_tx::test_rbf_removed_for_absent_tx(
                     s,
                 ),
+            )
+        }),
+        ("finalize_rejects_proposed_tx", |s| {
+            Box::pin(
+                test_finalize_rejects_proposed_tx::test_finalize_rejects_proposed_tx(s),
             )
         }),
         ("child_of_confirmed_rejected_tx", |s| {

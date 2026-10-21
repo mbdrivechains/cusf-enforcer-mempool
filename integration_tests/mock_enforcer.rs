@@ -27,6 +27,12 @@ use parking_lot::Mutex;
 #[error("mock enforcer: block is configured as invalid")]
 pub struct MockInvalidBlockReason;
 
+/// [`MockEnforcer::finalize_block_template`]'s dry-run rejection of a
+/// proposed tx, which it names (bip300301_enforcer#634)
+#[derive(Debug, thiserror::Error)]
+#[error("mock enforcer: dry run rejects tx `{0}`")]
+pub struct MockFinalizeRejection(pub Txid);
+
 #[derive(Clone, Debug)]
 pub enum MockCall {
     SyncToTip(BlockHash),
@@ -39,6 +45,8 @@ pub enum MockCall {
 #[derive(Default)]
 struct MockEnforcerInner {
     reject_txids: HashSet<Txid>,
+    /// Txs that `finalize_block_template` rejects if a template proposes them
+    finalize_reject_txids: HashSet<Txid>,
     reject_all: bool,
     reject_blocks: HashSet<BlockHash>,
     reject_all_blocks: bool,
@@ -66,6 +74,13 @@ impl MockEnforcer {
 
     pub fn reject_tx(&self, txid: Txid) {
         self.inner.lock().reject_txids.insert(txid);
+    }
+
+    /// Make `finalize_block_template` fail, naming `txid`, whenever a
+    /// template proposes it: a tx that passed admission and later fails the
+    /// enforcer's dry run (bip300301_enforcer#634).
+    pub fn reject_at_finalize(&self, txid: Txid) {
+        self.inner.lock().finalize_reject_txids.insert(txid);
     }
 
     /// Make both `connect_block` and `validate_block` reject `block_hash`.
@@ -285,17 +300,33 @@ impl CusfBlockProducer for MockEnforcer {
         Ok(())
     }
 
-    type FinalizeBlockTemplateError = Infallible;
+    type FinalizeBlockTemplateError = MockFinalizeRejection;
 
     async fn finalize_block_template<const COINBASE_TXN: bool>(
         &self,
         _parent_block_hash: &BlockHash,
         _coinbase_txn_wit: typewit::const_marker::BoolWit<COINBASE_TXN>,
-        _template: &mut FilledBlockTemplate<COINBASE_TXN>,
+        template: &mut FilledBlockTemplate<COINBASE_TXN>,
     ) -> Result<(), Self::FinalizeBlockTemplateError>
     where
         typewit::const_marker::Bool<COINBASE_TXN>: CoinbaseTxn,
     {
-        Ok(())
+        let inner = self.inner.lock();
+        match template
+            .as_mut()
+            .prefix_txs
+            .iter()
+            .map(|(tx, _)| tx.compute_txid())
+            .find(|txid| inner.finalize_reject_txids.contains(txid))
+        {
+            Some(txid) => Err(MockFinalizeRejection(txid)),
+            None => Ok(()),
+        }
+    }
+
+    fn finalize_rejected_txid(
+        err: &Self::FinalizeBlockTemplateError,
+    ) -> Option<Txid> {
+        Some(err.0)
     }
 }
