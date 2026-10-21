@@ -674,33 +674,72 @@ async fn block_txs<const COINBASE_TXN: bool, BP>(
         .checked_add(prefix_txs_weight)
         .and_then(|weight| weight.checked_add(suffix_txs_weight))
         .ok_or(BuildBlockError::WeightOverflow)?;
-    let mempool_txs = mempool.propose_txs(Some(Weight::from_wu(
+    let max_proposal_weight = Weight::from_wu(
         mempool::MAX_USABLE_BLOCK_WEIGHT
             .to_wu()
             .saturating_sub(initial_block_template_weight.to_wu()),
-    )))?;
-    tracing::debug!(
-        proposed_txids = %DisplayList(|| mempool_txs.iter().map(|tx| tx.txid)),
-        "Proposed {} tx(s) for inclusion in block", mempool_txs.len(),
     );
-    let mut filled_block_template: FilledBlockTemplate<COINBASE_TXN> =
+    let base_filled_block_template: FilledBlockTemplate<COINBASE_TXN> =
         initial_block_template.into();
-    filled_block_template
-        .prefix_txs
-        .extend(mempool_txs.iter().map(|tx| {
-            let fee = tx.fee.unsigned_abs();
-            let tx = bitcoin::consensus::deserialize(&tx.data).unwrap();
-            (tx, fee)
-        }));
-    tracing::debug!("Adding block template suffix");
-    let () = block_producer
-        .finalize_block_template(
-            parent_block_hash,
-            typewit::MakeTypeWitness::MAKE,
-            &mut filled_block_template,
-        )
-        .await
-        .map_err(BuildBlockError::FinalizeBlockTemplate)?;
+    // A proposed tx can pass admission and later fail the enforcer's dry run
+    // (e.g. an M5 spending a Ctip that has since moved). Nothing re-checks
+    // it, so without this every call would fail on the same tx until a
+    // restart (bip300301_enforcer#634). Drop it and its descendants from this
+    // call's mempool copy and propose again, a bounded number of times.
+    const MAX_FINALIZE_RETRIES: usize = 10;
+    let mut finalize_retries = 0;
+    let (mempool_txs, mut filled_block_template) = loop {
+        let mempool_txs = mempool.propose_txs(Some(max_proposal_weight))?;
+        tracing::debug!(
+            proposed_txids = %DisplayList(|| mempool_txs.iter().map(|tx| tx.txid)),
+            "Proposed {} tx(s) for inclusion in block", mempool_txs.len(),
+        );
+        let mut filled_block_template = base_filled_block_template.clone();
+        filled_block_template
+            .prefix_txs
+            .extend(mempool_txs.iter().map(|tx| {
+                let fee = tx.fee.unsigned_abs();
+                let tx = bitcoin::consensus::deserialize(&tx.data).unwrap();
+                (tx, fee)
+            }));
+        tracing::debug!("Adding block template suffix");
+        match block_producer
+            .finalize_block_template(
+                parent_block_hash,
+                typewit::MakeTypeWitness::MAKE,
+                &mut filled_block_template,
+            )
+            .await
+        {
+            Ok(()) => break (mempool_txs, filled_block_template),
+            Err(err) => {
+                let rejected_txid = BP::finalize_rejected_txid(&err)
+                    .filter(|txid| mempool_txs.iter().any(|tx| tx.txid == *txid));
+                let Some(rejected_txid) = rejected_txid else {
+                    return Err(BuildBlockError::FinalizeBlockTemplate(err));
+                };
+                if finalize_retries >= MAX_FINALIZE_RETRIES {
+                    return Err(BuildBlockError::FinalizeBlockTemplate(err));
+                }
+                finalize_retries += 1;
+                let removed_txs = mempool
+                    .try_filter(true, |tx, _| {
+                        Result::<_, Infallible>::Ok(
+                            tx.compute_txid() != rejected_txid,
+                        )
+                    })
+                    .map_err(|err| match err {
+                        either::Either::Left(err) => err,
+                    })?;
+                tracing::warn!(
+                    %rejected_txid,
+                    removed_txids = %DisplayList(|| removed_txs.keys()),
+                    retry = finalize_retries,
+                    "Block template dry run rejected a proposed tx; proposing again without it and its descendants: {err:#}",
+                );
+            }
+        }
+    };
     res_txs.extend(mempool_txs);
     res_txs.extend(filled_block_template.suffix_txs().iter().map(
         |(tx, fee)| BlockTemplateTransaction {
