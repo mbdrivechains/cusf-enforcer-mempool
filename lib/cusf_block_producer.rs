@@ -1,6 +1,6 @@
 use std::{convert::Infallible, fmt::Debug, future::Future};
 
-use bitcoin::{BlockHash, TxOut};
+use bitcoin::{BlockHash, TxOut, Txid};
 use either::Either;
 
 use crate::cusf_enforcer::{self, CusfEnforcer};
@@ -186,6 +186,16 @@ pub trait CusfBlockProducer: CusfEnforcer {
     ) -> impl Future<Output = Result<(), Self::FinalizeBlockTemplateError>> + Send
     where
         typewit::const_marker::Bool<COINBASE_TXN>: CoinbaseTxn;
+
+    /// The proposed mempool tx that a [`Self::finalize_block_template`]
+    /// error was caused by, if there is one. The template is then rebuilt
+    /// without that tx and its descendants, instead of every call failing on
+    /// the same tx until a restart (bip300301_enforcer#634).
+    fn finalize_rejected_txid(
+        _err: &Self::FinalizeBlockTemplateError,
+    ) -> Option<Txid> {
+        None
+    }
 }
 
 impl<C0, C1> CusfBlockProducer for cusf_enforcer::Compose<C0, C1>
@@ -254,6 +264,15 @@ where
             .await
             .map_err(Either::Right)?;
         Ok(())
+    }
+
+    fn finalize_rejected_txid(
+        err: &Self::FinalizeBlockTemplateError,
+    ) -> Option<Txid> {
+        match err {
+            Either::Left(err) => C0::finalize_rejected_txid(err),
+            Either::Right(err) => C1::finalize_rejected_txid(err),
+        }
     }
 }
 
@@ -353,6 +372,15 @@ where
                 )
                 .await
                 .map_err(Either::Right),
+        }
+    }
+
+    fn finalize_rejected_txid(
+        err: &Self::FinalizeBlockTemplateError,
+    ) -> Option<Txid> {
+        match err {
+            Either::Left(err) => C0::finalize_rejected_txid(err),
+            Either::Right(err) => C1::finalize_rejected_txid(err),
         }
     }
 }
