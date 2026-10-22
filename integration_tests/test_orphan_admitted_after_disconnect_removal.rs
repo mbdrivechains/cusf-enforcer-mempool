@@ -65,6 +65,10 @@ pub async fn test_orphan_admitted_after_disconnect_removal(
         "package still in bitcoind mempool",
     )
     .await?;
+    // Txs rejected at a block event are asked about again after the next
+    // block connects (8bd03d9), so model an enforcer whose verdict on `parent`
+    // still stands: asked again, it rejects it again.
+    setup.enforcer.reject_tx(parent);
 
     let grandchild = submit_child_of(rpc, child, CHAINED_FEE_SAT).await?;
     wait_for_mempool_pred(
