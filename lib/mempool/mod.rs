@@ -1546,6 +1546,8 @@ mod tests {
 
         mempool.remove_with_descendants(&x_txid).expect(
             "removing an ancestor must not underflow a descendant's fee total",
+        );
+    }
 
     thread_local! {
         /// Times `propose_txs_mut` took its "missing tx" warn path.
