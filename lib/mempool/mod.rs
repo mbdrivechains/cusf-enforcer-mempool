@@ -1658,6 +1658,8 @@ mod tests {
             "stale entry hit {} times",
             propose_missing()
         );
+    }
+
     fn info(mempool: &Mempool, tx: &Transaction) -> TxInfo {
         mempool.txs.0[&tx.compute_txid()].1.clone()
     }
