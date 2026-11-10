@@ -516,11 +516,6 @@ fn clamped_sub<T: Copy>(
     }
 }
 
-#[inline(always)]
-fn saturating_sub_fee(lhs: Amount, rhs: Amount) -> Amount {
-    lhs.checked_sub(rhs).unwrap_or(Amount::ZERO)
-}
-
 // MUST be cheap to clone so that constructing block templates is cheap
 #[derive(Clone, Debug)]
 pub struct Mempool {
